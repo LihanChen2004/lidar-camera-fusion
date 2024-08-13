@@ -322,7 +322,7 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
   P_out->is_dense = true;
   P_out->width = (int) P_out->points.size();
   P_out->height = 1;
-  P_out->header.frame_id = "velodyne";
+  P_out->header.frame_id = msg_pointCloud->header.frame_id;
   pc_pub.publish (P_out);
 
  // cv::Mat interdephtImage =  cv::Mat::zeros(ZI.n_rows, ZI.n_cols*2, cv_bridge::getCvType("mono16"));

@@ -70,205 +70,189 @@ pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME
 ///////////////////////////////////////callback
 
 void callback(
-  const boost::shared_ptr<const sensor_msgs::PointCloud2> & in_pc2, const ImageConstPtr & in_image)
+  const boost::shared_ptr<const sensor_msgs::PointCloud2> & input_cloud,
+  const ImageConstPtr & input_image)
 {
   // 图像数据转换
-  cv_bridge::CvImagePtr cv_ptr, color_pcl;
+  cv_bridge::CvImagePtr cv_image_ptr, color_image_ptr;
   try {
-    cv_ptr = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
-    color_pcl = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
+    cv_image_ptr = cv_bridge::toCvCopy(input_image, sensor_msgs::image_encodings::BGR8);
+    color_image_ptr = cv_bridge::toCvCopy(input_image, sensor_msgs::image_encodings::BGR8);
   } catch (cv_bridge::Exception & e) {
     ROS_ERROR("cv_bridge exception: %s", e.what());
     return;
   }
+
   // 点云数据转换 sensor_msgs::PointCloud2 -> pcl::PointCloud<pcl::PointXYZI>
   pcl::PCLPointCloud2 pcl_pc2;
-  pcl_conversions::toPCL(*in_pc2, pcl_pc2);
-  PointCloud::Ptr msg_pointCloud(new PointCloud);
-  pcl::fromPCLPointCloud2(pcl_pc2, *msg_pointCloud);
+  pcl_conversions::toPCL(*input_cloud, pcl_pc2);
+  PointCloud::Ptr original_cloud(new PointCloud);
+  pcl::fromPCLPointCloud2(pcl_pc2, *original_cloud);
 
   // 点云过滤，移除点云中的 NaN 点，并根据距离过滤点云。
-  if (msg_pointCloud == nullptr) return;
-  PointCloud::Ptr cloud_in(new PointCloud);
-  PointCloud::Ptr cloud_out(new PointCloud);
+  if (original_cloud == nullptr) return;
+
+  PointCloud::Ptr filtered_cloud(new PointCloud);
   std::vector<int> indices;
-  pcl::removeNaNFromPointCloud(*msg_pointCloud, *cloud_in, indices);
-  for (int i = 0; i < (int)cloud_in->points.size(); i++) {
-    double distance = sqrt(
-      cloud_in->points[i].x * cloud_in->points[i].x +
-      cloud_in->points[i].y * cloud_in->points[i].y);
+  pcl::removeNaNFromPointCloud(*original_cloud, *filtered_cloud, indices);
+
+  PointCloud::Ptr distance_filtered_cloud(new PointCloud);
+  for (const auto & point : filtered_cloud->points) {
+    double distance = std::sqrt(point.x * point.x + point.y * point.y);
     if (distance < minlen || distance > maxlen) continue;
-    cloud_out->push_back(cloud_in->points[i]);
+    distance_filtered_cloud->push_back(point);
   }
 
   // 点云投影到图像
-  Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
+  Eigen::Affine3f sensor_pose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
   rangeImage->pcl::RangeImage::createFromPointCloud(
-    *cloud_out, pcl::deg2rad(angular_resolution_x), pcl::deg2rad(angular_resolution_y),
-    pcl::deg2rad(max_angle_width), pcl::deg2rad(max_angle_height), sensorPose, coordinate_frame,
-    0.0f, 0.0f, 0);
+    *distance_filtered_cloud, pcl::deg2rad(angular_resolution_x),
+    pcl::deg2rad(angular_resolution_y), pcl::deg2rad(max_angle_width),
+    pcl::deg2rad(max_angle_height), sensor_pose, coordinate_frame, 0.0f, 0.0f, 0);
 
-  int cols_img = rangeImage->width;
-  int rows_img = rangeImage->height;
+  int img_width = rangeImage->width;
+  int img_height = rangeImage->height;
 
-  arma::mat Z;   // 图像插值
-  arma::mat Zz;  // 图像高度插值
+  arma::mat range_matrix(img_height, img_width, arma::fill::zeros);
+  arma::mat height_matrix(img_height, img_width, arma::fill::zeros);
 
-  Z.zeros(rows_img, cols_img);
-  Zz.zeros(rows_img, cols_img);
+  for (int i = 0; i < img_width; ++i) {
+    for (int j = 0; j < img_height; ++j) {
+      float range = rangeImage->getPoint(i, j).range;
+      float height = rangeImage->getPoint(i, j).z;
 
-  Eigen::MatrixXf ZZei(rows_img, cols_img);
-
-  for (int i = 0; i < cols_img; ++i)
-    for (int j = 0; j < rows_img; ++j) {
-      float r = rangeImage->getPoint(i, j).range;
-      float zz = rangeImage->getPoint(i, j).z;
-
-      if (std::isinf(r) || r < minlen || r > maxlen || std::isnan(zz)) {
+      if (std::isinf(range) || range < minlen || range > maxlen || std::isnan(height)) {
         continue;
       }
-      Z.at(j, i) = r;
-      Zz.at(j, i) = zz;
+      range_matrix(j, i) = range;
+      height_matrix(j, i) = height;
     }
+  }
 
   // 图像插值
-  arma::vec X = arma::regspace(1, Z.n_cols);                              // X = horizontal spacing
-  arma::vec Y = arma::regspace(1, Z.n_rows);                              // Y = vertical spacing
-  arma::vec XI = arma::regspace(X.min(), 1.0, X.max());                   // magnify by approx 2
-  arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_value, Y.max());  //
-  arma::mat ZI;
-  arma::mat ZzI;
+  arma::vec X = arma::regspace(1, range_matrix.n_cols);
+  arma::vec Y = arma::regspace(1, range_matrix.n_rows);
+  arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
+  arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_value, Y.max());
+  arma::mat interpolated_range_matrix;
+  arma::mat interpolated_height_matrix;
 
-  arma::interp2(X, Y, Z, XI, YI, ZI, "lineal");
-  arma::interp2(X, Y, Zz, XI, YI, ZzI, "lineal");
+  arma::interp2(X, Y, range_matrix, XI, YI, interpolated_range_matrix, "lineal");
+  arma::interp2(X, Y, height_matrix, XI, YI, interpolated_height_matrix, "lineal");
 
-  // 重建图像到三维点云
-  PointCloud::Ptr point_cloud(new PointCloud);
-  PointCloud::Ptr cloud(new PointCloud);
-  point_cloud->width = ZI.n_cols;
-  point_cloud->height = ZI.n_rows;
-  point_cloud->is_dense = false;
-  point_cloud->points.resize(point_cloud->width * point_cloud->height);
+  // 过滤与背景插值的元素
+  arma::mat filtered_interpolated_range_matrix = interpolated_range_matrix;
 
-  arma::mat Zout = ZI;
-
-  //用于过滤与背景插值的元素
-  for (uint i = 0; i < ZI.n_rows; i++) {
-    for (uint j = 0; j < ZI.n_cols; j++) {
-      if (ZI(i, j) == 0) {
-        if (i + interpol_value < ZI.n_rows)
-          for (int k = 1; k <= interpol_value; k++) Zout(i + k, j) = 0;
-        if (i > interpol_value)
-          for (int k = 1; k <= interpol_value; k++) Zout(i - k, j) = 0;
+  for (uint i = 0; i < interpolated_range_matrix.n_rows; i++) {
+    for (uint j = 0; j < interpolated_range_matrix.n_cols; j++) {
+      if (interpolated_range_matrix(i, j) == 0) {
+        if (i + interpol_value < interpolated_range_matrix.n_rows) {
+          for (int k = 1; k <= interpol_value; k++) {
+            filtered_interpolated_range_matrix(i + k, j) = 0;
+          }
+        }
+        if (i > interpol_value) {
+          for (int k = 1; k <= interpol_value; k++) {
+            filtered_interpolated_range_matrix(i - k, j) = 0;
+          }
+        }
       }
     }
   }
 
   // 将范围图像转换为点云
-  int num_pc = 0;
-  for (uint i = 0; i < ZI.n_rows - interpol_value; i++) {
-    for (uint j = 0; j < ZI.n_cols; j++) {
-      float ang = M_PI - ((2.0 * M_PI * j) / (ZI.n_cols));
+  PointCloud::Ptr output_cloud(new PointCloud);
+  output_cloud->width = interpolated_range_matrix.n_cols;
+  output_cloud->height = interpolated_range_matrix.n_rows;
+  output_cloud->is_dense = false;
+  output_cloud->points.resize(output_cloud->width * output_cloud->height);
 
-      if (ang < min_FOV - M_PI / 2.0 || ang > max_FOV - M_PI / 2.0) continue;
+  int num_points = 0;
+  for (uint i = 0; i < interpolated_range_matrix.n_rows - interpol_value; i++) {
+    for (uint j = 0; j < interpolated_range_matrix.n_cols; j++) {
+      float angle = M_PI - ((2.0 * M_PI * j) / (interpolated_range_matrix.n_cols));
 
-      if (!(Zout(i, j) == 0)) {
-        float pc_modulo = Zout(i, j);
-        float pc_x = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * cos(ang);
-        float pc_y = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * sin(ang);
+      if (angle < min_FOV - M_PI / 2.0 || angle > max_FOV - M_PI / 2.0) continue;
 
-        float ang_x_lidar = 0.6 * M_PI / 180.0;
+      if (filtered_interpolated_range_matrix(i, j) != 0) {
+        float distance = filtered_interpolated_range_matrix(i, j);
+        float x = std::sqrt(std::pow(distance, 2) - std::pow(interpolated_height_matrix(i, j), 2)) *
+                  std::cos(angle);
+        float y = std::sqrt(std::pow(distance, 2) - std::pow(interpolated_height_matrix(i, j), 2)) *
+                  std::sin(angle);
 
-        Eigen::MatrixXf Lidar_matrix(
-          3, 3);  // matrix transformation between lidar and range image. It
-                  // rotates the angles that it has of error with respect to
-                  // the ground
-        Eigen::MatrixXf result(3, 1);
-        Lidar_matrix << cos(ang_x_lidar), 0, sin(ang_x_lidar), 0, 1, 0, -sin(ang_x_lidar), 0,
-          cos(ang_x_lidar);
+        float lidar_angle_correction = 0.6 * M_PI / 180.0;
 
-        result << pc_x, pc_y, ZzI(i, j);
+        Eigen::MatrixXf lidar_rotation_matrix(3, 3);
+        lidar_rotation_matrix << std::cos(lidar_angle_correction), 0,
+          std::sin(lidar_angle_correction), 0, 1, 0, -std::sin(lidar_angle_correction), 0,
+          std::cos(lidar_angle_correction);
 
-        result = Lidar_matrix * result;  // 在X轴上进行旋转以进行校正
+        Eigen::Vector3f point_in_lidar_frame(x, y, interpolated_height_matrix(i, j));
+        point_in_lidar_frame = lidar_rotation_matrix * point_in_lidar_frame;
 
-        point_cloud->points[num_pc].x = result(0);
-        point_cloud->points[num_pc].y = result(1);
-        point_cloud->points[num_pc].z = result(2);
+        output_cloud->points[num_points].x = point_in_lidar_frame.x();
+        output_cloud->points[num_points].y = point_in_lidar_frame.y();
+        output_cloud->points[num_points].z = point_in_lidar_frame.z();
 
-        cloud->push_back(point_cloud->points[num_pc]);
-
-        num_pc++;
+        num_points++;
       }
     }
   }
 
-  PointCloud::Ptr P_out(new PointCloud);
+  // clang-format off
+  Eigen::Matrix4f lidar_to_camera_transform;
+  lidar_to_camera_transform << Rlc(0), Rlc(3), Rlc(6), Tlc(0),
+                               Rlc(1), Rlc(4), Rlc(7), Tlc(1),
+                               Rlc(2), Rlc(5), Rlc(8), Tlc(2),
+                               0, 0, 0, 1;
+  // clang-format on
 
-  P_out = cloud;
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_point_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
 
-  Eigen::MatrixXf RTlc(4, 4);  // translation matrix lidar-camera
-  RTlc << Rlc(0), Rlc(3), Rlc(6), Tlc(0), Rlc(1), Rlc(4), Rlc(7), Tlc(1), Rlc(2), Rlc(5), Rlc(8),
-    Tlc(2), 0, 0, 0, 1;
+  for (int i = 0; i < num_points; i++) {
+    Eigen::Vector4f point_in_lidar_frame(
+      -output_cloud->points[i].y, -output_cloud->points[i].z, output_cloud->points[i].x, 1.0);
 
-  int size_inter_Lidar = (int)P_out->points.size();
+    Eigen::Vector3f point_in_camera_frame = Mc * (lidar_to_camera_transform * point_in_lidar_frame);
 
-  Eigen::MatrixXf Lidar_camera(3, size_inter_Lidar);
-  Eigen::MatrixXf Lidar_cam(3, 1);
-  Eigen::MatrixXf pc_matrix(4, 1);
-  Eigen::MatrixXf pointCloud_matrix(4, size_inter_Lidar);
+    int image_x = static_cast<int>(point_in_camera_frame.x() / point_in_camera_frame.z());
+    int image_y = static_cast<int>(point_in_camera_frame.y() / point_in_camera_frame.z());
 
-  unsigned int cols = in_image->width;
-  unsigned int rows = in_image->height;
+    if (
+      image_x < 0 || image_x >= input_image->width || image_y < 0 ||
+      image_y >= input_image->height) {
+      continue;
+    }
 
-  uint px_data = 0;
-  uint py_data = 0;
+    auto & color = color_image_ptr->image.at<cv::Vec3b>(image_y, image_x);
 
-  pcl::PointXYZRGB point;
+    pcl::PointXYZRGB colored_point;
+    colored_point.x = output_cloud->points[i].x;
+    colored_point.y = output_cloud->points[i].y;
+    colored_point.z = output_cloud->points[i].z;
+    colored_point.r = color[2];
+    colored_point.g = color[1];
+    colored_point.b = color[0];
 
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color(new pcl::PointCloud<pcl::PointXYZRGB>);
+    colored_point_cloud->points.push_back(colored_point);
 
-  // 生成带颜色的点云
-  for (int i = 0; i < size_inter_Lidar; i++) {
-    pc_matrix(0, 0) = -P_out->points[i].y;
-    pc_matrix(1, 0) = -P_out->points[i].z;
-    pc_matrix(2, 0) = P_out->points[i].x;
-    pc_matrix(3, 0) = 1.0;
-
-    Lidar_cam = Mc * (RTlc * pc_matrix);
-
-    px_data = (int)(Lidar_cam(0, 0) / Lidar_cam(2, 0));
-    py_data = (int)(Lidar_cam(1, 0) / Lidar_cam(2, 0));
-
-    if (px_data < 0.0 || px_data >= cols || py_data < 0.0 || py_data >= rows) continue;
-
-    int color_dis_x = (int)(255 * ((P_out->points[i].x) / maxlen));
-    int color_dis_z = (int)(255 * ((P_out->points[i].x) / 10.0));
-    if (color_dis_z > 255) color_dis_z = 255;
-
-    // point cloud con color
-    auto & color = color_pcl->image.at<cv::Vec3b>(py_data, px_data);
-
-    point.x = P_out->points[i].x;
-    point.y = P_out->points[i].y;
-    point.z = P_out->points[i].z;
-
-    point.r = (int)color[2];
-    point.g = (int)color[1];
-    point.b = (int)color[0];
-
-    pc_color->points.push_back(point);
+    int color_intensity_x = static_cast<int>(255 * (output_cloud->points[i].x / maxlen));
+    int color_intensity_z =
+      std::min(static_cast<int>(255 * (output_cloud->points[i].x / 10.0)), 255);
 
     cv::circle(
-      cv_ptr->image, cv::Point(px_data, py_data), 1,
-      CV_RGB(255 - color_dis_x, (int)(color_dis_z), color_dis_x), cv::FILLED);
+      cv_image_ptr->image, cv::Point(image_x, image_y), 1,
+      CV_RGB(255 - color_intensity_x, color_intensity_z, color_intensity_x), cv::FILLED);
   }
-  pc_color->is_dense = true;
-  pc_color->width = (int)pc_color->points.size();
-  pc_color->height = 1;
-  pc_color->header.frame_id = msg_pointCloud->header.frame_id;
 
-  pcOnimg_pub.publish(cv_ptr->toImageMsg());
-  pc_pub.publish(pc_color);
+  colored_point_cloud->is_dense = true;
+  colored_point_cloud->width = static_cast<int>(colored_point_cloud->points.size());
+  colored_point_cloud->height = 1;
+  colored_point_cloud->header.frame_id = original_cloud->header.frame_id;
+
+  pcOnimg_pub.publish(cv_image_ptr->toImageMsg());
+  pc_pub.publish(colored_point_cloud);
 }
 
 int main(int argc, char ** argv)
@@ -291,19 +275,22 @@ int main(int argc, char ** argv)
 
   XmlRpc::XmlRpcValue param;
 
+  // clang-format off
   nh.getParam("/matrix_file/tlc", param);
-  Tlc << (double)param[0], (double)param[1], (double)param[2];
+  Tlc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]);
 
   nh.getParam("/matrix_file/rlc", param);
 
-  Rlc << (double)param[0], (double)param[1], (double)param[2], (double)param[3], (double)param[4],
-    (double)param[5], (double)param[6], (double)param[7], (double)param[8];
+  Rlc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]),
+         static_cast<double>(param[3]), static_cast<double>(param[4]), static_cast<double>(param[5]),
+         static_cast<double>(param[6]), static_cast<double>(param[7]), static_cast<double>(param[8]);
 
   nh.getParam("/matrix_file/camera_matrix", param);
 
-  Mc << (double)param[0], (double)param[1], (double)param[2], (double)param[3], (double)param[4],
-    (double)param[5], (double)param[6], (double)param[7], (double)param[8], (double)param[9],
-    (double)param[10], (double)param[11];
+  Mc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]), static_cast<double>(param[3]),
+        static_cast<double>(param[4]), static_cast<double>(param[5]), static_cast<double>(param[6]), static_cast<double>(param[7]),
+        static_cast<double>(param[8]), static_cast<double>(param[9]), static_cast<double>(param[10]), static_cast<double>(param[11]);
+  // clang-format on
 
   message_filters::Subscriber<PointCloud2> pc_sub(nh, pcTopic, 1);
   message_filters::Subscriber<Image> img_sub(nh, imgTopic, 1);

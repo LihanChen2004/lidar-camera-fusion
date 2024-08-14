@@ -259,6 +259,7 @@ int main(int argc, char ** argv)
 {
   ros::init(argc, argv, "pontCloudOntImage");
   ros::NodeHandle nh;
+  pcl::console::setVerbosityLevel(pcl::console::L_ERROR); // Disable warnings, so PC copying doesn't complain about missing RGB field
 
   /// Load Parameters
   nh.getParam("/maxlen", maxlen);

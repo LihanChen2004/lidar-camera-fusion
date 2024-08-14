@@ -51,11 +51,8 @@ float z_min = 100.0f;
 
 float max_depth = 100.0;
 float min_depth = 8.0;
-double max_var = 50.0;
 
 float interpol_value = 20.0;
-
-bool f_pc = true;
 
 // input topics
 std::string imgTopic = "/camera/color/image_raw";
@@ -146,8 +143,6 @@ void callback(
   arma::interp2(X, Y, Zz, XI, YI, ZzI, "lineal");
 
   // 重建图像到三维点云
-  //============================================================================================================
-
   PointCloud::Ptr point_cloud(new PointCloud);
   PointCloud::Ptr cloud(new PointCloud);
   point_cloud->width = ZI.n_cols;
@@ -167,24 +162,6 @@ void callback(
           for (int k = 1; k <= interpol_value; k++) Zout(i - k, j) = 0;
       }
     }
-  }
-
-  if (f_pc) {
-    //用于过滤与背景插值的元素
-    // 根据方差进行过滤
-    for (uint i = 0; i < ((ZI.n_rows - 1) / interpol_value); i++)
-      for (uint j = 0; j < ZI.n_cols - 5; j++) {
-        double promedio = 0;
-        double varianza = 0;
-        for (uint k = 0; k < interpol_value; k++)
-          promedio = promedio + ZI((i * interpol_value) + k, j);
-        promedio = promedio / interpol_value;
-        for (uint l = 0; l < interpol_value; l++)
-          varianza = varianza + pow((ZI((i * interpol_value) + l, j) - promedio), 2.0);
-        if (varianza > max_var)
-          for (uint m = 0; m < interpol_value; m++) Zout((i * interpol_value) + m, j) = 0;
-      }
-    ZI = Zout;
   }
 
   // 将范围图像转换为点云
@@ -306,8 +283,6 @@ int main(int argc, char ** argv)
   nh.getParam("/min_ang_FOV", min_FOV);
   nh.getParam("/pcTopic", pcTopic);
   nh.getParam("/imgTopic", imgTopic);
-  nh.getParam("/max_var", max_var);
-  nh.getParam("/filter_output_pc", f_pc);
 
   nh.getParam("/x_resolution", angular_resolution_x);
   nh.getParam("/y_interpolation", interpol_value);

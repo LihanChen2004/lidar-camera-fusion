@@ -75,6 +75,7 @@ pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME
 void callback(
   const boost::shared_ptr<const sensor_msgs::PointCloud2> & in_pc2, const ImageConstPtr & in_image)
 {
+  // 图像数据转换
   cv_bridge::CvImagePtr cv_ptr, color_pcl;
   try {
     cv_ptr = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
@@ -83,27 +84,18 @@ void callback(
     ROS_ERROR("cv_bridge exception: %s", e.what());
     return;
   }
-
-  // Conversion from sensor_msgs::PointCloud2 to pcl::PointCloud<T>
+  // 点云数据转换 sensor_msgs::PointCloud2 -> pcl::PointCloud<pcl::PointXYZI>
   pcl::PCLPointCloud2 pcl_pc2;
   pcl_conversions::toPCL(*in_pc2, pcl_pc2);
   PointCloud::Ptr msg_pointCloud(new PointCloud);
   pcl::fromPCLPointCloud2(pcl_pc2, *msg_pointCloud);
-  ///
 
-  ////// filter point cloud
+  // 点云过滤，移除点云中的 NaN 点，并根据距离过滤点云。
   if (msg_pointCloud == nullptr) return;
-
   PointCloud::Ptr cloud_in(new PointCloud);
-  // PointCloud::Ptr cloud_filter (new PointCloud);
   PointCloud::Ptr cloud_out(new PointCloud);
-
-  // PointCloud::Ptr cloud_aux (new PointCloud);
-  // pcl::PointXYZI point_aux;
-
   std::vector<int> indices;
   pcl::removeNaNFromPointCloud(*msg_pointCloud, *cloud_in, indices);
-
   for (int i = 0; i < (int)cloud_in->points.size(); i++) {
     double distance = sqrt(
       cloud_in->points[i].x * cloud_in->points[i].x +
@@ -112,9 +104,7 @@ void callback(
     cloud_out->push_back(cloud_in->points[i]);
   }
 
-  //                                                  point cloud to image
-  //============================================================================================================
-
+  // 点云投影到图像
   Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
   rangeImage->pcl::RangeImage::createFromPointCloud(
     *cloud_out, pcl::deg2rad(angular_resolution_x), pcl::deg2rad(angular_resolution_y),
@@ -124,8 +114,8 @@ void callback(
   int cols_img = rangeImage->width;
   int rows_img = rangeImage->height;
 
-  arma::mat Z;   // interpolation de la imagen
-  arma::mat Zz;  // interpolation de las alturas de la imagen
+  arma::mat Z;   // 图像插值
+  arma::mat Zz;  // 图像高度插值
 
   Z.zeros(rows_img, cols_img);
   Zz.zeros(rows_img, cols_img);
@@ -137,46 +127,25 @@ void callback(
       float r = rangeImage->getPoint(i, j).range;
       float zz = rangeImage->getPoint(i, j).z;
 
-      // Eigen::Vector3f tmp_point;
-      // rangeImage->calculate3DPoint (float(i), float(j), r, tmp_point);
       if (std::isinf(r) || r < minlen || r > maxlen || std::isnan(zz)) {
         continue;
       }
       Z.at(j, i) = r;
       Zz.at(j, i) = zz;
-      // ZZei(j,i)=tmp_point[2];
-
-      // point_aux.x = tmp_point[0];
-      // point_aux.y = tmp_point[1];
-      // point_aux.z = tmp_point[2];
-
-      // cloud_aux->push_back(point_aux);
-
-      // std::cout<<"i: "<<i<<" Z.getpoint: "<<zz<<" tmpPoint:
-      // "<<tmp_point<<std::endl;
     }
 
-  ////////////////////////////////////////////// interpolation
-  //============================================================================================================
-
-  arma::vec X = arma::regspace(1, Z.n_cols);  // X = horizontal spacing
-  arma::vec Y = arma::regspace(1, Z.n_rows);  // Y = vertical spacing
-
+  // 图像插值
+  arma::vec X = arma::regspace(1, Z.n_cols);                              // X = horizontal spacing
+  arma::vec Y = arma::regspace(1, Z.n_rows);                              // Y = vertical spacing
   arma::vec XI = arma::regspace(X.min(), 1.0, X.max());                   // magnify by approx 2
   arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_value, Y.max());  //
-
-  arma::mat ZI_near;
   arma::mat ZI;
   arma::mat ZzI;
 
   arma::interp2(X, Y, Z, XI, YI, ZI, "lineal");
   arma::interp2(X, Y, Zz, XI, YI, ZzI, "lineal");
 
-  //===========================================fin filtrado por
-  // imagen=================================================
-  /////////////////////////////
-
-  // reconstruccion de imagen a nube 3D
+  // 重建图像到三维点云
   //============================================================================================================
 
   PointCloud::Ptr point_cloud(new PointCloud);
@@ -188,49 +157,40 @@ void callback(
 
   arma::mat Zout = ZI;
 
-  //////////////////filtrado de elementos interpolados con el fondo
-  for (uint i = 0; i < ZI.n_rows; i += 1) {
-    for (uint j = 0; j < ZI.n_cols; j += 1) {
+  //用于过滤与背景插值的元素
+  for (uint i = 0; i < ZI.n_rows; i++) {
+    for (uint j = 0; j < ZI.n_cols; j++) {
       if (ZI(i, j) == 0) {
         if (i + interpol_value < ZI.n_rows)
-          for (int k = 1; k <= interpol_value; k += 1) Zout(i + k, j) = 0;
+          for (int k = 1; k <= interpol_value; k++) Zout(i + k, j) = 0;
         if (i > interpol_value)
-          for (int k = 1; k <= interpol_value; k += 1) Zout(i - k, j) = 0;
+          for (int k = 1; k <= interpol_value; k++) Zout(i - k, j) = 0;
       }
     }
   }
 
   if (f_pc) {
-    //////////////////filtrado de elementos interpolados con el fondo
-
-    /// filtrado por varianza
-    for (uint i = 0; i < ((ZI.n_rows - 1) / interpol_value); i += 1)
-      for (uint j = 0; j < ZI.n_cols - 5; j += 1) {
+    //用于过滤与背景插值的元素
+    // 根据方差进行过滤
+    for (uint i = 0; i < ((ZI.n_rows - 1) / interpol_value); i++)
+      for (uint j = 0; j < ZI.n_cols - 5; j++) {
         double promedio = 0;
         double varianza = 0;
-        for (uint k = 0; k < interpol_value; k += 1)
-          //  for(uint jj=j; jj<5+j ; jj+=1)
+        for (uint k = 0; k < interpol_value; k++)
           promedio = promedio + ZI((i * interpol_value) + k, j);
-
-        //  promedio = promedio / (interpol_value*5.0);
         promedio = promedio / interpol_value;
-
         for (uint l = 0; l < interpol_value; l++)
-          //  for(uint jj=j; jj<5+j ; jj+=1)
           varianza = varianza + pow((ZI((i * interpol_value) + l, j) - promedio), 2.0);
-
-        // varianza = sqrt(varianza / interpol_value);
-
         if (varianza > max_var)
           for (uint m = 0; m < interpol_value; m++) Zout((i * interpol_value) + m, j) = 0;
       }
     ZI = Zout;
   }
 
-  ///////// imagen de rango a nube de puntos
+  // 将范围图像转换为点云
   int num_pc = 0;
-  for (uint i = 0; i < ZI.n_rows - interpol_value; i += 1) {
-    for (uint j = 0; j < ZI.n_cols; j += 1) {
+  for (uint i = 0; i < ZI.n_rows - interpol_value; i++) {
+    for (uint j = 0; j < ZI.n_cols; j++) {
       float ang = M_PI - ((2.0 * M_PI * j) / (ZI.n_cols));
 
       if (ang < min_FOV - M_PI / 2.0 || ang > max_FOV - M_PI / 2.0) continue;
@@ -243,7 +203,7 @@ void callback(
         float ang_x_lidar = 0.6 * M_PI / 180.0;
 
         Eigen::MatrixXf Lidar_matrix(
-          3, 3);  // matrix  transformation between lidar and range image. It
+          3, 3);  // matrix transformation between lidar and range image. It
                   // rotates the angles that it has of error with respect to
                   // the ground
         Eigen::MatrixXf result(3, 1);
@@ -252,7 +212,7 @@ void callback(
 
         result << pc_x, pc_y, ZzI(i, j);
 
-        result = Lidar_matrix * result;  // rotacion en eje X para correccion
+        result = Lidar_matrix * result;  // 在X轴上进行旋转以进行校正
 
         point_cloud->points[num_pc].x = result(0);
         point_cloud->points[num_pc].y = result(1);
@@ -265,30 +225,13 @@ void callback(
     }
   }
 
-  //============================================================================================================
-
   PointCloud::Ptr P_out(new PointCloud);
-
-  // filremove noise of point cloud
-  /*pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
-  sor.setInputCloud (cloud);
-  sor.setMeanK (50.0);
-  sor.setStddevMulThresh (1.0);
-  sor.filter (*P_out);*/
-
-  // dowsmapling
-  /*pcl::VoxelGrid<pcl::PointXYZI> sor;
-  sor.setInputCloud (cloud);
-  sor.setLeafSize (0.1f, 0.1f, 0.1f);
-  sor.filter (*P_out);*/
 
   P_out = cloud;
 
   Eigen::MatrixXf RTlc(4, 4);  // translation matrix lidar-camera
   RTlc << Rlc(0), Rlc(3), Rlc(6), Tlc(0), Rlc(1), Rlc(4), Rlc(7), Tlc(1), Rlc(2), Rlc(5), Rlc(8),
     Tlc(2), 0, 0, 0, 1;
-
-  // std::cout<<RTlc<<std::endl;
 
   int size_inter_Lidar = (int)P_out->points.size();
 
@@ -307,8 +250,7 @@ void callback(
 
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color(new pcl::PointCloud<pcl::PointXYZRGB>);
 
-  // P_out = cloud_out;
-
+  // 生成带颜色的点云
   for (int i = 0; i < size_inter_Lidar; i++) {
     pc_matrix(0, 0) = -P_out->points[i].y;
     pc_matrix(1, 0) = -P_out->points[i].z;

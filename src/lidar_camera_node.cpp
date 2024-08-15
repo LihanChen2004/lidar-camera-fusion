@@ -64,10 +64,8 @@ Eigen::MatrixXf Rlc(3, 3);  // rotation matrix lidar-camera
 Eigen::MatrixXf Mc(3, 4);   // camera calibration matrix
 
 // range image parametros
-boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
+boost::shared_ptr<pcl::RangeImageSpherical> range_image;
 pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME;
-
-///////////////////////////////////////callback
 
 void callback(
   const boost::shared_ptr<const sensor_msgs::PointCloud2> & input_cloud,
@@ -75,51 +73,40 @@ void callback(
 {
   // 图像数据转换
   cv_bridge::CvImagePtr cv_image_ptr, color_image_ptr;
-  try {
-    cv_image_ptr = cv_bridge::toCvCopy(input_image, sensor_msgs::image_encodings::BGR8);
-    color_image_ptr = cv_bridge::toCvCopy(input_image, sensor_msgs::image_encodings::BGR8);
-  } catch (cv_bridge::Exception & e) {
-    ROS_ERROR("cv_bridge exception: %s", e.what());
-    return;
-  }
+  cv_image_ptr = cv_bridge::toCvCopy(input_image, sensor_msgs::image_encodings::BGR8);
+  color_image_ptr = cv_bridge::toCvCopy(input_image, sensor_msgs::image_encodings::BGR8);
 
   // 点云数据转换 sensor_msgs::PointCloud2 -> pcl::PointCloud<pcl::PointXYZI>
-  pcl::PCLPointCloud2 pcl_pc2;
-  pcl_conversions::toPCL(*input_cloud, pcl_pc2);
   PointCloud::Ptr original_cloud(new PointCloud);
-  pcl::fromPCLPointCloud2(pcl_pc2, *original_cloud);
+  pcl::fromROSMsg(*input_cloud, *original_cloud);
 
   // 点云过滤，移除点云中的 NaN 点，并根据距离过滤点云。
   if (original_cloud == nullptr) return;
 
-  PointCloud::Ptr filtered_cloud(new PointCloud);
-  std::vector<int> indices;
-  pcl::removeNaNFromPointCloud(*original_cloud, *filtered_cloud, indices);
+  std::vector<int> index;
+  pcl::removeNaNFromPointCloud(*original_cloud, *original_cloud, index);
 
-  PointCloud::Ptr distance_filtered_cloud(new PointCloud);
-  for (const auto & point : filtered_cloud->points) {
+  PointCloud::Ptr distance_original_cloud(new PointCloud);
+  for (const auto & point : original_cloud->points) {
     double distance = std::sqrt(point.x * point.x + point.y * point.y);
     if (distance < minlen || distance > maxlen) continue;
-    distance_filtered_cloud->push_back(point);
+    distance_original_cloud->push_back(point);
   }
 
   // 点云投影到图像
   Eigen::Affine3f sensor_pose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
-  rangeImage->pcl::RangeImage::createFromPointCloud(
-    *distance_filtered_cloud, pcl::deg2rad(angular_resolution_x),
+  range_image->pcl::RangeImage::createFromPointCloud(
+    *distance_original_cloud, pcl::deg2rad(angular_resolution_x),
     pcl::deg2rad(angular_resolution_y), pcl::deg2rad(max_angle_width),
     pcl::deg2rad(max_angle_height), sensor_pose, coordinate_frame, 0.0f, 0.0f, 0);
 
-  int img_width = rangeImage->width;
-  int img_height = rangeImage->height;
+  arma::mat range_matrix(range_image->height, range_image->width, arma::fill::zeros);
+  arma::mat height_matrix(range_image->height, range_image->width, arma::fill::zeros);
 
-  arma::mat range_matrix(img_height, img_width, arma::fill::zeros);
-  arma::mat height_matrix(img_height, img_width, arma::fill::zeros);
-
-  for (int i = 0; i < img_width; ++i) {
-    for (int j = 0; j < img_height; ++j) {
-      float range = rangeImage->getPoint(i, j).range;
-      float height = rangeImage->getPoint(i, j).z;
+  for (int i = 0; i < range_image->width; i++) {
+    for (int j = 0; j < range_image->height; j++) {
+      float range = range_image->getPoint(i, j).range;
+      float height = range_image->getPoint(i, j).z;
 
       if (std::isinf(range) || range < minlen || range > maxlen || std::isnan(height)) {
         continue;
@@ -183,13 +170,17 @@ void callback(
 
         float lidar_angle_correction = 0.6 * M_PI / 180.0;
 
-        Eigen::MatrixXf lidar_rotation_matrix(3, 3);
-        lidar_rotation_matrix << std::cos(lidar_angle_correction), 0,
-          std::sin(lidar_angle_correction), 0, 1, 0, -std::sin(lidar_angle_correction), 0,
-          std::cos(lidar_angle_correction);
+        // clang-format off
+        Eigen::MatrixXf lidar_rotation_matrix(3, 3);  // transformation between lidar and range image. It rotates the angles that it has of error with respect to the ground
+        lidar_rotation_matrix << 
+          std::cos(lidar_angle_correction), 0, std::sin(lidar_angle_correction),
+          0, 1, 0,
+          -std::sin(lidar_angle_correction), 0, std::cos(lidar_angle_correction);
+        // clang-format on
 
         Eigen::Vector3f point_in_lidar_frame(x, y, interpolated_height_matrix(i, j));
-        point_in_lidar_frame = lidar_rotation_matrix * point_in_lidar_frame;
+        point_in_lidar_frame =
+          lidar_rotation_matrix * point_in_lidar_frame;  // rotacion en eje X para correccion
 
         output_cloud->points[num_points].x = point_in_lidar_frame.x();
         output_cloud->points[num_points].y = point_in_lidar_frame.y();
@@ -259,7 +250,8 @@ int main(int argc, char ** argv)
 {
   ros::init(argc, argv, "pontCloudOntImage");
   ros::NodeHandle nh;
-  pcl::console::setVerbosityLevel(pcl::console::L_ERROR); // Disable warnings, so PC copying doesn't complain about missing RGB field
+  // Disable warnings, so PC copying doesn't complain about missing RGB field
+  pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
 
   /// Load Parameters
   nh.getParam("/maxlen", maxlen);
@@ -300,7 +292,7 @@ int main(int argc, char ** argv)
   Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
   sync.registerCallback(boost::bind(&callback, _1, _2));
   pcOnimg_pub = nh.advertise<sensor_msgs::Image>("/pcOnImage_image", 1);
-  rangeImage = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
+  range_image = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
 
   pc_pub = nh.advertise<PointCloud>("/points2", 1);
 
